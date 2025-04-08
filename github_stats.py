@@ -178,6 +178,57 @@ class Queries(object):
 """
 
     @staticmethod
+    def organizations() -> str:
+        """
+        GraphQL query to get organizations the user is part of.
+        """
+        return """
+        {
+          viewer {
+            organizations(first: 100) {
+              nodes {
+                login
+              }
+            }
+          }
+        }
+        """
+
+    @staticmethod
+    def org_repos(org: str, cursor: Optional[str] = None) -> str:
+        """
+        GraphQL query to get repositories of an organization.
+        """
+        return f"""
+        {{
+          organization(login: "{org}") {{
+            repositories(first: 100, after: {f'"{cursor}"' if cursor else "null"}, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
+              pageInfo {{
+                hasNextPage
+                endCursor
+              }}
+              nodes {{
+                nameWithOwner
+                stargazers {{
+                  totalCount
+                }}
+                forkCount
+                languages(first: 10, orderBy: {{field: SIZE, direction: DESC}}) {{
+                  edges {{
+                    size
+                    node {{
+                      name
+                      color
+                    }}
+                  }}
+                }}
+              }}
+            }}
+          }}
+        }}
+        """
+
+    @staticmethod
     def contrib_years() -> str:
         """
         :return: GraphQL query to get all years the user has been a contributor
@@ -271,91 +322,106 @@ Languages:
   - {formatted_languages}"""
 
     async def get_stats(self) -> None:
-        """
-        Get lots of summary statistics using one big query. Sets many attributes
-        """
         self._stargazers = 0
         self._forks = 0
         self._languages = dict()
         self._repos = set()
         self._ignored_repos = set()
-        
+
         next_owned = None
         next_contrib = None
         while True:
             raw_results = await self.queries.query(
-                Queries.repos_overview(owned_cursor=next_owned,
-                                       contrib_cursor=next_contrib)
+                Queries.repos_overview(owned_cursor=next_owned, contrib_cursor=next_contrib)
             )
-            raw_results = raw_results if raw_results is not None else {}
+            raw_results = raw_results or {}
 
-            self._name = (raw_results
-                          .get("data", {})
-                          .get("viewer", {})
-                          .get("name", None))
-            if self._name is None:
-                self._name = (raw_results
-                              .get("data", {})
-                              .get("viewer", {})
-                              .get("login", "No Name"))
+            self._name = (raw_results.get("data", {}).get("viewer", {}).get("name") or
+                          raw_results.get("data", {}).get("viewer", {}).get("login", "No Name"))
 
-            contrib_repos = (raw_results
-                             .get("data", {})
-                             .get("viewer", {})
-                             .get("repositoriesContributedTo", {}))
-            owned_repos = (raw_results
-                           .get("data", {})
-                           .get("viewer", {})
-                           .get("repositories", {}))
-            
+            contrib_repos = raw_results.get("data", {}).get("viewer", {}).get("repositoriesContributedTo", {})
+            owned_repos = raw_results.get("data", {}).get("viewer", {}).get("repositories", {})
+
             repos = owned_repos.get("nodes", [])
             if self._consider_forked_repos:
                 repos += contrib_repos.get("nodes", [])
             else:
                 for repo in contrib_repos.get("nodes", []):
                     name = repo.get("nameWithOwner")
-                    if name in self._ignored_repos or name in self._exclude_repos:
-                        continue
-                    self._ignored_repos.add(name)
+                    if name not in self._exclude_repos:
+                        self._ignored_repos.add(name)
 
             for repo in repos:
                 name = repo.get("nameWithOwner")
                 if name in self._repos or name in self._exclude_repos:
                     continue
                 self._repos.add(name)
-                self._stargazers += repo.get("stargazers").get("totalCount", 0)
+                self._stargazers += repo.get("stargazers", {}).get("totalCount", 0)
                 self._forks += repo.get("forkCount", 0)
 
                 for lang in repo.get("languages", {}).get("edges", []):
-                    name = lang.get("node", {}).get("name", "Other")
-                    languages = await self.languages
-                    if name in self._exclude_langs: continue
-                    if name in languages:
-                        languages[name]["size"] += lang.get("size", 0)
-                        languages[name]["occurrences"] += 1
+                    lang_name = lang.get("node", {}).get("name", "Other")
+                    if lang_name in self._exclude_langs:
+                        continue
+                    if lang_name in self._languages:
+                        self._languages[lang_name]["size"] += lang.get("size", 0)
+                        self._languages[lang_name]["occurrences"] += 1
                     else:
-                        languages[name] = {
+                        self._languages[lang_name] = {
                             "size": lang.get("size", 0),
                             "occurrences": 1,
                             "color": lang.get("node", {}).get("color")
                         }
 
-            if owned_repos.get("pageInfo", {}).get("hasNextPage", False) or \
-                    contrib_repos.get("pageInfo", {}).get("hasNextPage", False):
-                next_owned = (owned_repos
-                              .get("pageInfo", {})
-                              .get("endCursor", next_owned))
-                next_contrib = (contrib_repos
-                                .get("pageInfo", {})
-                                .get("endCursor", next_contrib))
-            else:
+            if not (owned_repos.get("pageInfo", {}).get("hasNextPage") or
+                    contrib_repos.get("pageInfo", {}).get("hasNextPage")):
                 break
 
-        # TODO: Improve languages to scale by number of contributions to
-        #       specific filetypes
+            next_owned = owned_repos.get("pageInfo", {}).get("endCursor")
+            next_contrib = contrib_repos.get("pageInfo", {}).get("endCursor")
+
+        # Fetch and analyze org repos
+        orgs_query = await self.queries.query(Queries.organizations())
+        orgs = orgs_query.get("data", {}).get("viewer", {}).get("organizations", {}).get("nodes", [])
+        for org in orgs:
+            org_login = org.get("login")
+            cursor = None
+            while True:
+                org_query = await self.queries.query(Queries.org_repos(org_login, cursor))
+                org_data = org_query.get("data", {}).get("organization", {})
+                repos = org_data.get("repositories", {}).get("nodes", [])
+
+                for repo in repos:
+                    name = repo.get("nameWithOwner")
+                    if name in self._repos or name in self._exclude_repos:
+                        continue
+                    self._repos.add(name)
+                    self._stargazers += repo.get("stargazers", {}).get("totalCount", 0)
+                    self._forks += repo.get("forkCount", 0)
+
+                    for lang in repo.get("languages", {}).get("edges", []):
+                        lang_name = lang.get("node", {}).get("name", "Other")
+                        if lang_name in self._exclude_langs:
+                            continue
+                        if lang_name in self._languages:
+                            self._languages[lang_name]["size"] += lang.get("size", 0)
+                            self._languages[lang_name]["occurrences"] += 1
+                        else:
+                            self._languages[lang_name] = {
+                                "size": lang.get("size", 0),
+                                "occurrences": 1,
+                                "color": lang.get("node", {}).get("color")
+                            }
+
+                page_info = org_data.get("repositories", {}).get("pageInfo", {})
+                if page_info.get("hasNextPage"):
+                    cursor = page_info.get("endCursor")
+                else:
+                    break
+
         langs_total = sum([v.get("size", 0) for v in self._languages.values()])
         for k, v in self._languages.items():
-            v["prop"] = 100 * (v.get("size", 0) / langs_total)
+            v["prop"] = 100 * (v["size"] / langs_total)
 
     @property
     async def name(self) -> str:
