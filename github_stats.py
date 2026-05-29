@@ -20,7 +20,7 @@ class Queries(object):
     """
 
     def __init__(self, username: str, access_token: str,
-                 session: aiohttp.ClientSession, max_connections: int = 3):
+                 session: aiohttp.ClientSession, max_connections: int = 5):
         self.username = username
         self.access_token = access_token
         self.session = session
@@ -353,8 +353,9 @@ class Stats(object):
         self._total_contributions = None
         self._languages = None
         self._repos = None
+        self._contrib_repos = None
         self._lines_changed = None
-        self._views = None        
+        self._views = None
 
     async def to_str(self) -> str:
         """
@@ -383,6 +384,13 @@ Languages:
         self._languages = dict()
         self._repos = set()
         self._ignored_repos = set()
+        # Repos where the user may actually have line contributions (owned +
+        # contributed). Kept separate from the org-wide repo set so that
+        # lines_changed only polls the relevant repos — GitHub's
+        # /stats/contributors endpoint cannot compute on-demand stats for
+        # hundreds of repos, so polling org repos the user never touched both
+        # wastes the budget and contributes nothing.
+        self._contrib_repos = set()
 
         next_owned = None
         next_contrib = None
@@ -397,6 +405,16 @@ Languages:
 
             contrib_repos = raw_results.get("data", {}).get("viewer", {}).get("repositoriesContributedTo", {})
             owned_repos = raw_results.get("data", {}).get("viewer", {}).get("repositories", {})
+
+            # Record owned + contributed repos for lines_changed (see
+            # _contrib_repos note in get_stats). This is the set in which the
+            # user can have authored lines, regardless of the forked-repo
+            # setting, which only affects language/star aggregation below.
+            for repo in (owned_repos.get("nodes", []) +
+                         contrib_repos.get("nodes", [])):
+                name = repo.get("nameWithOwner")
+                if name and name not in self._exclude_repos:
+                    self._contrib_repos.add(name)
 
             repos = owned_repos.get("nodes", [])
             if self._consider_forked_repos:
@@ -559,6 +577,20 @@ Languages:
         return self._repos | self._ignored_repos
 
     @property
+    async def contrib_repos(self) -> Set[str]:
+        """
+        :return: set of repos the user owns or has contributed to — the repos
+                in which the user can have authored lines. Used by
+                lines_changed instead of the full (org-inclusive) repo set,
+                which GitHub's stats endpoint cannot compute on demand.
+        """
+        if self._contrib_repos is not None:
+            return self._contrib_repos
+        await self.get_stats()
+        assert(self._contrib_repos is not None)
+        return self._contrib_repos
+
+    @property
     async def total_contributions(self) -> int:
         """
         :return: count of user's total contributions as defined by GitHub
@@ -590,7 +622,11 @@ Languages:
             return self._lines_changed
         additions = 0
         deletions = 0
-        repos = await self.all_repos
+        # Only the user's owned/contributed repos — not the full org-wide set.
+        # The user can only have authored lines in these, and GitHub's
+        # /stats/contributors endpoint cannot compute on-demand stats for the
+        # hundreds of repos in all_repos within any reasonable polling window.
+        repos = await self.contrib_repos
         # Fire every /stats/contributors request concurrently. GitHub computes
         # these stats asynchronously (returning 202 until ready), so issuing
         # them in parallel lets GitHub warm every repo's cache at once instead
