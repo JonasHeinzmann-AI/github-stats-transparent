@@ -19,7 +19,7 @@ class Queries(object):
     """
 
     def __init__(self, username: str, access_token: str,
-                 session: aiohttp.ClientSession, max_connections: int = 10):
+                 session: aiohttp.ClientSession, max_connections: int = 5):
         self.username = username
         self.access_token = access_token
         self.session = session
@@ -71,36 +71,52 @@ class Queries(object):
             "Authorization": f"token {self.access_token}",
         }
 
+        url = f"https://api.github.com/{path}"
         for attempt in range(retries):
+            backoff = min(2 * (attempt + 1), 30)
             try:
                 async with self.semaphore:
-                    r = await self.session.get(f"https://api.github.com/{path}",
-                                               headers=headers,
+                    r = await self.session.get(url, headers=headers,
                                                params=tuple(params.items()))
-                if r.status == 202:
-                    # The first 202 only triggers the computation; subsequent
-                    # ones mean it is still running. Back off progressively
-                    # (capped) so large repos have time to finish without us
-                    # hammering the API or giving up too early.
-                    await asyncio.sleep(min(2 * (attempt + 1), 30))
+                    status = r.status
+                    if status == 200:
+                        return await r.json()
+                    # 204 No Content: the repo has no stats (e.g. empty repo).
+                    if status == 204:
+                        return dict()
+                    if status in (403, 429):
+                        # Primary or secondary (abuse) rate limiting. Honour
+                        # Retry-After / the rate-limit reset, then retry. Only
+                        # bail out when it is a genuine permission error (not a
+                        # rate limit), since retrying that is pointless.
+                        retry_after = r.headers.get("Retry-After")
+                        remaining = r.headers.get("X-RateLimit-Remaining")
+                        if retry_after is not None or remaining == "0":
+                            wait = (int(retry_after)
+                                    if (retry_after or "").isdigit()
+                                    else min(2 ** attempt, 60))
+                            print(f"Rate limited on {path}; waiting {wait}s "
+                                  f"before retrying...")
+                            await asyncio.sleep(wait)
+                            continue
+                        print(f"Access denied (403) for {path}; skipping.")
+                        return dict()
+                # 202: the endpoint computes asynchronously and returns 202
+                # (empty body) until ready. The first 202 only *triggers* the
+                # computation. Back off progressively (outside the semaphore so
+                # the slot frees up for other repos while we wait).
+                if status == 202:
+                    await asyncio.sleep(backoff)
                     continue
-
-                result = await r.json()
-                if result is not None:
-                    return result
-            except:
-                print("aiohttp failed for rest query")
-                # Fall back on non-async requests
-                async with self.semaphore:
-                    r = requests.get(f"https://api.github.com/{path}",
-                                     headers=headers,
-                                     params=tuple(params.items()))
-                    if r.status_code == 202:
-                        await asyncio.sleep(min(2 * (attempt + 1), 30))
-                        continue
-                    elif r.status_code == 200:
-                        return r.json()
-        print(f"There were too many 202s. Data for {path} will be incomplete.")
+                # Any other status (404, 422, 5xx, ...): brief retry then give up.
+                await asyncio.sleep(backoff)
+            except Exception:
+                # Transient network/JSON error (e.g. dropped connection under
+                # load). Back off and retry rather than dropping the repo.
+                print(f"Request failed for {path}; retrying...")
+                await asyncio.sleep(backoff)
+        print(f"Gave up after {retries} attempts. Data for {path} will be "
+              f"incomplete.")
         return dict()
 
     @staticmethod
