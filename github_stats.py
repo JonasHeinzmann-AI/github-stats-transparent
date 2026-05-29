@@ -50,31 +50,39 @@ class Queries(object):
                                   json={"query": generated_query})
                 return r.json()
 
-    async def query_rest(self, path: str, params: Optional[Dict] = None) -> Dict:
+    async def query_rest(self, path: str, params: Optional[Dict] = None,
+                         retries: int = 60) -> Dict:
         """
         Make a request to the REST API
         :param path: API path to query
         :param params: Query parameters to be passed to the API
+        :param retries: Number of times to retry while the endpoint returns 202.
+            Endpoints such as ``/stats/contributors`` compute their data
+            asynchronously and return HTTP 202 (with an empty body) until the
+            data is ready; we have to poll until we receive a 200.
         :return: deserialized REST JSON output
         """
 
-        for _ in range(60):
-            headers = {
-                "Authorization": f"token {self.access_token}",
-            }
-            if params is None:
-                params = dict()
-            if path.startswith("/"):
-                path = path[1:]
+        if params is None:
+            params = dict()
+        if path.startswith("/"):
+            path = path[1:]
+        headers = {
+            "Authorization": f"token {self.access_token}",
+        }
+
+        for attempt in range(retries):
             try:
                 async with self.semaphore:
                     r = await self.session.get(f"https://api.github.com/{path}",
                                                headers=headers,
                                                params=tuple(params.items()))
                 if r.status == 202:
-                    # print(f"{path} returned 202. Retrying...")
-                    print(f"A path returned 202. Retrying...")
-                    await asyncio.sleep(2)
+                    # The first 202 only triggers the computation; subsequent
+                    # ones mean it is still running. Back off progressively
+                    # (capped) so large repos have time to finish without us
+                    # hammering the API or giving up too early.
+                    await asyncio.sleep(min(2 * (attempt + 1), 30))
                     continue
 
                 result = await r.json()
@@ -88,13 +96,11 @@ class Queries(object):
                                      headers=headers,
                                      params=tuple(params.items()))
                     if r.status_code == 202:
-                        print(f"A path returned 202. Retrying...")
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(min(2 * (attempt + 1), 30))
                         continue
                     elif r.status_code == 200:
                         return r.json()
-        # print(f"There were too many 202s. Data for {path} will be incomplete.")
-        print("There were too many 202s. Data for this repository will be incomplete.")
+        print(f"There were too many 202s. Data for {path} will be incomplete.")
         return dict()
 
     @staticmethod
@@ -534,8 +540,24 @@ Languages:
             return self._lines_changed
         additions = 0
         deletions = 0
-        for repo in await self.all_repos:
-            r = await self.queries.query_rest(f"/repos/{repo}/stats/contributors")
+        repos = await self.all_repos
+        # Fire every /stats/contributors request concurrently. GitHub computes
+        # these stats asynchronously (returning 202 until ready), so issuing
+        # them in parallel lets GitHub warm every repo's cache at once instead
+        # of waiting on each repo serially. The semaphore still caps the number
+        # of simultaneous in-flight HTTP requests.
+        results = await asyncio.gather(*[
+            self.queries.query_rest(f"/repos/{repo}/stats/contributors")
+            for repo in repos
+        ])
+        incomplete = 0
+        for r in results:
+            # A successful response is a list of contributor objects. Anything
+            # else (e.g. an empty dict returned after exhausting 202 retries)
+            # means we could not retrieve this repo's stats.
+            if not isinstance(r, list):
+                incomplete += 1
+                continue
             for author_obj in r:
                 # Handle malformed response from the API by skipping this repo
                 if (not isinstance(author_obj, dict)
@@ -548,6 +570,12 @@ Languages:
                 for week in author_obj.get("weeks", []):
                     additions += week.get("a", 0)
                     deletions += week.get("d", 0)
+
+        if incomplete:
+            print(f"Warning: lines-changed stats were incomplete for "
+                  f"{incomplete}/{len(repos)} repositories (GitHub did not "
+                  f"finish computing them in time). The reported total is a "
+                  f"lower bound.")
 
         self._lines_changed = (additions, deletions)
         return self._lines_changed
